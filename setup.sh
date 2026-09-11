@@ -5,6 +5,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
+NAME="BiXia文献"
 DEST="${LITFETCH_DEST:-$HOME/.litfetch}"
 PY="$(command -v python3 || true)"
 ONLY="all"
@@ -50,7 +51,7 @@ PYEOF
 
 REG_JSON='
 import json, os, shutil, sys
-path, key_path, server_json, py, script = sys.argv[1:6]
+path, key_path, server_json, py, script, name = sys.argv[1:7]
 os.makedirs(os.path.dirname(path), exist_ok=True)
 cfg = {}
 if os.path.exists(path):
@@ -62,9 +63,9 @@ if os.path.exists(path):
 node = cfg
 for k in key_path.split("."):
     node = node.setdefault(k, {})
-if isinstance(node.get("litfetch"), dict):
+if isinstance(node.get(name), dict):
     print("[setup] %s: 已存在，更新" % path)
-node["litfetch"] = json.loads(server_json)
+node[name] = json.loads(server_json)
 json.dump(cfg, open(path, "w"), ensure_ascii=False, indent=2)
 print("[setup] 已注册: %s" % path)
 '
@@ -75,30 +76,30 @@ printf '%s' "$REG_JSON" > "$regtmp"
 register_zcode() {
   "$PY" "$regtmp" "$HOME/.zcode/cli/config.json" "mcp.servers" \
     "{\"type\":\"stdio\",\"command\":\"$PY\",\"args\":[\"$DEST/mcp_server.py\"],\"timeoutMs\":300000,\"enabled\":true}" \
-    "$PY" "$DEST/mcp_server.py" || warn "ZCode 注册失败"
+    "$PY" "$DEST/mcp_server.py" "$NAME" || warn "ZCode 注册失败"
 }
 
 register_claude_desktop() {
   "$PY" "$regtmp" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" "mcpServers" \
     "{\"command\":\"$PY\",\"args\":[\"$DEST/mcp_server.py\"]}" \
-    "$PY" "$DEST/mcp_server.py" || warn "Claude Desktop 注册失败"
+    "$PY" "$DEST/mcp_server.py" "$NAME" || warn "Claude Desktop 注册失败"
 }
 
 register_cursor() {
   "$PY" "$regtmp" "$HOME/.cursor/mcp.json" "mcpServers" \
     "{\"command\":\"$PY\",\"args\":[\"$DEST/mcp_server.py\"]}" \
-    "$PY" "$DEST/mcp_server.py" || warn "Cursor 注册失败"
+    "$PY" "$DEST/mcp_server.py" "$NAME" || warn "Cursor 注册失败"
 }
 
 register_claude_code() {
   if command -v claude >/dev/null 2>&1; then
-    if claude mcp list 2>/dev/null | grep -q "litfetch"; then
+    if claude mcp list 2>/dev/null | grep -q "$NAME"; then
       say "Claude Code: 已存在，跳过"
     else
-      if claude mcp add --scope user litfetch -- "$PY" "$DEST/mcp_server.py"; then
+      if claude mcp add --scope user "$NAME" -- "$PY" "$DEST/mcp_server.py"; then
         say "Claude Code: 已注册（user 级）"
       else
-        warn "Claude Code 注册失败，可手工执行: claude mcp add --scope user litfetch -- $PY $DEST/mcp_server.py"
+        warn "Claude Code 注册失败，可手工执行: claude mcp add --scope user \"$NAME\" -- $PY $DEST/mcp_server.py"
       fi
     fi
   else
@@ -112,13 +113,13 @@ register_codex() {
     warn "未检测到 ${f}，跳过 Codex"
     return
   fi
-  if grep -q 'mcp_servers\.litfetch' "$f"; then
+  if grep -qF "mcp_servers.\"$NAME\"" "$f"; then
     say "Codex: 已存在，跳过"
     return
   fi
   cp "$f" "$f.bak-litfetch"
   {
-    printf '\n[mcp_servers.litfetch]\n'
+    printf '\n[mcp_servers."%s"]\n' "$NAME"
     printf 'command = "%s"\n' "$PY"
     printf 'args = ["%s"]\n' "$DEST/mcp_server.py"
   } >> "$f"
@@ -152,7 +153,7 @@ fi
 cat <<'EOF'
 
 安装完成。各客户端重启后生效：
-  ZCode:          重启会话，Settings -> MCP 应显示 litfetch
+  ZCode:          重启会话，Settings -> MCP 应显示 $NAME
   Claude Code:    新会话里 /mcp 查看
   Claude Desktop: 重启应用
   Cursor:         重启应用

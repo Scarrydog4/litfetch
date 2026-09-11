@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-litfetch MCP 服务器（stdio, 零依赖）——把知网检索/下载/引用暴露为 MCP 工具。
+BiXia文献 MCP 服务器（stdio, 零依赖）——把知网检索/下载/引用暴露为 MCP 工具。
 
 多设备部署：把 ~/.paperforge/litfetch/ 整个目录复制到目标机器相同路径，
 装好 python3 + cryptography，再在目标机器 ~/.zcode/cli/config.json 的
@@ -147,7 +147,7 @@ def main():
             send({"jsonrpc": "2.0", "id": msg_id, "result": {
                 "protocolVersion": pv,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "litfetch", "version": "1.0.0"},
+                "serverInfo": {"name": "BiXia文献", "version": "1.0.0"},
             }})
         elif method == "notifications/initialized":
             pass
@@ -165,7 +165,7 @@ def main():
             except Exception as ex:  # noqa: BLE001
                 traceback.print_exc(file=sys.stderr)
                 send({"jsonrpc": "2.0", "id": msg_id, "result": {
-                    "content": [{"type": "text", "text": f"litfetch error: {ex}"}],
+                    "content": [{"type": "text", "text": f"BiXia文献 error: {ex}"}],
                     "isError": True}})
         elif is_request:
             send({"jsonrpc": "2.0", "id": msg_id,

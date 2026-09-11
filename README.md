@@ -1,4 +1,4 @@
-# litfetch 即用包 —— 知网文献检索/下载/引用（MCP + 命令行）
+# BiXia文献 —— 知网文献检索/下载/引用（MCP + 命令行，仓库名 litfetch）
 
 零第三方依赖（纯 python3 标准库），支持任何 MCP 客户端（ZCode / Claude Desktop /
 Claude Code / Cursor / Codex 及其他），也支持纯命令行使用。
@@ -28,8 +28,8 @@ git 用户也可以：`git clone https://github.com/Scarrydog4/litfetch.git && c
 只装部分客户端：`bash setup.sh --only zcode,claude-desktop,cursor,codex,claude-code`
 （不改配置只装文件：都不指定时默认全检测；注册前会自动备份原配置为 .bak-litfetch）
 
-装完重启对应客户端即可看到工具：**search**（检索）/ **fetch**（检索+下载+参考文献）/
-**download**（单篇下载）。命令行直接用：`~/.litfetch/litfetch.py search "关键词"`。
+MCP 注册名为 BiXia文献（工具形如 mcp__BiXia文献__search）。装完重启对应客户端即可看到工具：**search**（检索）/ **fetch**（检索+下载+参考文献）/
+**download**（单篇下载）。命令行直接用：`~/.litfetch/litfetch.py search "关键词"`。若个别客户端对中文工具名支持不佳（表现为工具不出或调用报错），把 setup.sh 顶部 NAME 改成 bixia-wenxian 重装即可。
 
 ## 这个包"即用"的原理与代价
 
