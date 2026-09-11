@@ -44,6 +44,9 @@ from pathlib import Path
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.4 Safari/605.1.15")
 AES_KEY = b"Q5vGEmoCW59MW4Qc"
+NODE_KEYS = {b"Q5vGEmoCW59MW4Qc": "api88.wenxian.shop"}  # 下载签名密钥按节点适配；新节点先测下载再登记
+CROSSREF_API = "https://api.crossref.org/works"
+ARXIV_API = "http://export.arxiv.org/api/query"
 
 
 # ---- 纯标准库 AES-128-ECB（仅加密），免去第三方依赖 ----
@@ -120,7 +123,7 @@ def _aes_ecb_encrypt(key, data):
     return bytes(out)
 SESSION_FILE = Path(__file__).resolve().parent / "session.json"  # 跟随脚本所在目录，便于整目录搬运
 DL_MIN_INTERVAL = float(os.environ.get("LITFETCH_DL_MIN_INTERVAL", "2.5"))
-DL_DAILY_CAP = int(os.environ.get("LITFETCH_DAILY_CAP", "300"))
+DL_DAILY_CAP = int(os.environ.get("LITFETCH_DAILY_CAP", "10"))  # 镜像单卡日限实测≈10篇（2026-09-12触顶确认）
 MAX_CONCURRENCY = min(3, int(os.environ.get("LITFETCH_MAX_CONCURRENCY", "3")))
 DB_TYPE = {"CAPJ": "J", "CJFQ": "J", "CDFD": "D", "CMFD": "D", "IPFD": "C",
            "CIPF": "C", "CCND": "N", "CCJD": "N", "CJFDb": "J"}
@@ -185,6 +188,7 @@ def provenance(row):
 class Client:
     def __init__(self, session=None):
         cfg = session or json.loads(SESSION_FILE.read_text())
+        self.session = cfg
         self.entry = cfg["entry"]
         self.member = cfg["cookies"]
         self.jar = CookieJar()
@@ -204,8 +208,22 @@ class Client:
         return (opener or self.opener).open(
             urllib.request.Request(url, data=data, headers=h), timeout=90)
 
-    def auth(self):
-        """入口→JWT→镜像会话。apiXX 下载域名与 kns8 落地地址均从响应动态取。"""
+    def auth(self, primary_only=False):
+        """入口→JWT→镜像会话，多入口轮换。apiXX 下载域名与 kns8 落地地址均从响应动态取。
+        primary_only=True 时只用第一个入口（下载签名密钥按节点适配，下载链固定主通道）。"""
+        entries = self.session.get("entries") or [self.entry]
+        if primary_only:
+            entries = entries[:1]
+        last = None
+        for ent in entries:
+            try:
+                return self._auth_one(ent)
+            except Exception as ex:  # noqa: BLE001
+                last = ex
+                continue
+        raise RuntimeError(f"全部入口失败（{len(entries)}个）: {last}")
+
+    def _auth_one(self, ent):
         for k, v in self.member.items():
             self.jar.set_cookie(Cookie(0, k, v, None, False, "xy.shutong2.com",
                                        True, False, "/", True, False, None, False,
@@ -267,7 +285,10 @@ class Client:
 
     def sign_download_url(self, row):
         if not self.dl_base:
-            self.auth()
+            self.auth(primary_only=True)
+        host = urllib.parse.urlsplit(self.dl_base).netloc
+        if host not in NODE_KEYS.values():
+            raise RuntimeError(f"节点 {host} 检索可用但下载签名未适配；请用默认通道重新检索下载")
         plaintext = row["abstract_query"]
         body = plaintext.encode()
         pad = 16 - len(body) % 16
@@ -287,6 +308,8 @@ class Client:
         page = self._req(signed, referer=self.landing).read().decode("utf-8", "replace")
         if "尚未授权" in page:
             raise RuntimeError("镜像会话失效，请重试（会重新走入口）；仍失败则更新session.json")
+        if "下载量已达上限" in page or "已达上限" in page:
+            raise RuntimeError("今日该卡下载额度已耗尽（镜像单卡日限≈10篇）：明天再试，或放 session-*.json 增卡分道")
         m = re.search(r'href="(https://docdown\.cnki\.net/[^"]+)"', page)
         if not m:
             raise RuntimeError("下载中转页未包含真实文件地址: " +
@@ -439,8 +462,12 @@ def _cited_source_year(line):
 
 
 def citation_mismatch(ref, best):
-    """题名命中后核对著录出处：期刊不符或年份不符 → 返回差异说明；一致返回 None。"""
-    src, year = _cited_source_year(ref)
+    """题名命中后核对著录出处：期刊不符或年份不符 → 返回差异说明；一致返回 None。
+    ref 可为引用串或已解析 (source, year) 元组。"""
+    if isinstance(ref, tuple):
+        src, year = ref
+    else:
+        src, year = _cited_source_year(ref)
     if src is None:
         return None
     actual_src = (best.get("source") or "").strip()
@@ -460,6 +487,11 @@ def verify_citations(lines, client=None):
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+        tag_ref = re.search(r"\[([A-Z]+(?:/OL)?)\]", line)
+        tag_v = tag_ref.group(1) if tag_ref else ""
+        if _is_english_ref(line) and tag_v.split("/")[0] in ("J", "C"):
+            out.append(_verify_en(line, _title_from_citation(line)))
             continue
         title = _title_from_citation(line)
         try:
@@ -494,6 +526,115 @@ def verify_citations(lines, client=None):
     return out
 
 
+
+# ---- 英文文献通道（Crossref / arXiv，免费公开API，无会员依赖） ----
+def _crossref_rows(query, size):
+    url = (f"{CROSSREF_API}?query.bibliographic={urllib.parse.quote(query)}"
+           f"&rows={min(size, 30)}&select=DOI,title,author,container-title,issued,volume,issue,page,type")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    items = json.loads(urllib.request.urlopen(req, timeout=40).read()).get("message", {}).get("items", [])
+    rows = []
+    for it in items:
+        if not it.get("title"):
+            continue
+        au = [f"{a.get('family', '')} {' '.join(w[0] for w in a.get('given', '').split() if w)}".strip()
+              for a in it.get("author", [])][:6]
+        year = ""
+        try:
+            year = str(it["issued"]["date-parts"][0][0])
+        except Exception:
+            pass
+        rows.append({"title": it["title"][0].strip(), "authors": au,
+                     "source": (it.get("container-title") or [""])[0], "date": year,
+                     "fileid": it.get("DOI", ""), "dbname": "ENJ",
+                     "vol": it.get("volume", ""), "issue": it.get("issue", ""), "page": it.get("page", ""),
+                     "query": query})
+    return rows
+
+
+def _arxiv_rows(query, size):
+    url = (f"{ARXIV_API}?search_query=all:{urllib.parse.quote(query)}"
+           f"&start=0&max_results={min(size, 20)}")
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    xml = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "replace")
+    rows = []
+    for entry in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
+        t = re.search(r"<title>(.*?)</title>", entry, re.S)
+        aid = re.search(r"<id>http://arxiv.org/abs/([^<]+)</id>", entry)
+        pub = re.search(r"<published>(\d{4})", entry)
+        aus = re.findall(r"<name>([^<]+)</name>", entry)
+        if not (t and aid):
+            continue
+        rows.append({"title": re.sub(r"\s+", " ", t.group(1)).strip(),
+                     "authors": [a.strip() for a in aus][:6], "source": "arXiv preprint",
+                     "date": pub.group(1) if pub else "", "fileid": aid.group(1),
+                     "dbname": "ENPRE", "query": query})
+    return rows
+
+
+def gbt7714_en(row):
+    aus = row.get("authors") or ["Anonymous"]
+    astr = ", ".join(aus[:3]) + (", et al" if len(aus) > 3 else "")
+    year = (row.get("date") or "")[:4] or "n.d."
+    src = row.get("source") or ""
+    vip = ""
+    if row.get("vol"):
+        vip = f", {row['vol']}" + (f"({row['issue']})" if row.get("issue") else "") +               (f": {row['page']}" if row.get("page") else "")
+    if row.get("dbname") == "ENPRE":
+        return f"{aus[0]}{' et al' if len(aus) > 1 else ''}. {row['title']}[EB/OL]. arXiv:{row['fileid']}, {year}."
+    return f"{astr}. {row['title']}[J]. {src}, {year}{vip}."
+
+
+def search_en(query, size=10, source="crossref"):
+    """英文文献检索：crossref（正式期刊，带DOI）或 arxiv（预印本）。"""
+    rows = _crossref_rows(query, size) if source == "crossref" else _arxiv_rows(query, size)
+    for r in rows:
+        r["cite"] = gbt7714_en(r)
+        r["provenance"] = {"engine": f"litfetch/{source}", "fileid": r["fileid"],
+                           "query": query, "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    return rows
+
+
+def _is_english_ref(ref):
+    return len(re.findall(r"[A-Za-z]", ref)) > len(re.findall(r"[\u4e00-\u9fff]", ref)) * 2
+
+
+def _verify_en(line, title):
+    """英文期刊类回查 Crossref：题名相似度>=0.75 判实，带 DOI 与出处比对。
+    同题多版本（预印本/再版/短题名）常见：检索词混入著录期刊名，候选优先期刊或年份也对上的行。"""
+    import difflib
+    src_cited, year_cited = _cited_source_year(line)
+    q = title + (f" {src_cited}" if src_cited else "")
+    rows = _crossref_rows(q, 8)
+    cands = []
+    for r in rows:
+        rr = difflib.SequenceMatcher(None, r["title"].lower(), title.lower()).ratio()
+        if rr < 0.75:
+            continue
+        jm = bool(src_cited) and src_cited.lower() in (r.get("source") or "").lower()
+        ym = bool(year_cited) and year_cited == (r.get("date") or "")[:4]
+        cands.append((rr + 0.15 * jm + 0.08 * ym, rr, r))
+    best, ratio = None, 0.0
+    if cands:
+        cands.sort(key=lambda x: -x[0])
+        _, ratio, best = cands[0]
+    if best and ratio >= 0.75:
+        out = {"input": line, "verified": True, "confidence": round(ratio, 3),
+               "matched_title": best["title"], "authors": best["authors"],
+               "source": best["source"], "date": best["date"], "fileid": best["fileid"],
+               "dbname": "ENJ", "standard_cite": gbt7714_en(best),
+               "provenance": {"engine": "litfetch/crossref", "doi": best["fileid"],
+                              "query": q, "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}}
+        mm = citation_mismatch(_cited_source_year(line), {"source": best["source"], "date": best["date"]})
+        if mm:
+            out.update({"verified": "mismatch", "citation_mismatch": mm,
+                        "note": "题名真实存在，但著录出处与Crossref记录不符，须修正条目"})
+        return out
+    return {"input": line, "verified": False, "confidence": round(ratio, 3),
+            "reason": "Crossref未命中（编造嫌疑或题名抄错）",
+            "closest": best["title"] if best else None}
+
+
 def out_json(obj):
     print(json.dumps(obj, ensure_ascii=False, indent=1))
 
@@ -517,6 +658,10 @@ def main():
     p3.add_argument("--out", required=True)
     p3.add_argument("--concurrency", type=int, default=2,
                     help=f"进程内下载并发，默认2，硬上限{MAX_CONCURRENCY}（跨进程另有间隔限速与日上限）")
+    p0 = sub.add_parser("search-en", help="英文文献检索（Crossref正式期刊带DOI / arXiv预印本）")
+    p0.add_argument("keyword")
+    p0.add_argument("--size", type=int, default=10)
+    p0.add_argument("--source", choices=["crossref", "arxiv"], default="crossref")
     p4 = sub.add_parser("verify", help="核验参考文献列表真实性（每行一条引用；防编造引用）")
     p4.add_argument("file", nargs="?", help="引用列表文件；缺省读stdin")
     p4.add_argument("--out", help="可选：把核验报告另存为 markdown")
@@ -524,6 +669,16 @@ def main():
 
     if args.cmd == "search":
         rows = Client(load_sessions()[0][1]).search(args.keyword, args.page, args.size)
+        out_json({"count": len(rows), "query": args.keyword,
+                  "results": [{**r, "cite": gbt7714(r), "provenance": provenance(r),
+                               "abstract_query": r["abstract_query"][:24] + "…"}
+                              for r in rows]})
+        return
+    if args.cmd == "search-en":
+        rows = search_en(args.keyword, args.size, args.source)
+        out_json({"count": len(rows), "query": args.keyword, "source": args.source,
+                  "results": [{k: v for k, v in r.items() if k != "abstract_query"} for r in rows]})
+        return
         out_json({"count": len(rows), "query": args.keyword,
                   "results": [{**r, "cite": gbt7714(r), "provenance": provenance(r),
                                "abstract_query": r["abstract_query"][:24] + "…"}

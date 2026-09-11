@@ -69,6 +69,20 @@ TOOLS = [
         },
     },
     {
+        "name": "search_en",
+        "description": ("英文文献检索：Crossref（正式期刊，带DOI，免费公开API）或 arXiv（预印本）。"
+                       "返回题名/作者/期刊/年份/DOI/GB7714引用/溯源。与中文通道互补。"),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "size": {"type": "integer", "default": 10, "maximum": 30},
+                "source": {"type": "string", "enum": ["crossref", "arxiv"], "default": "crossref"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "verify",
         "description": ("核验参考文献真实性：逐条回查知网镜像，题名相似度>=0.75 判实。"
                        "用于论文定稿前防编造引用；只检索不下载，可放心批量。"),
@@ -106,6 +120,14 @@ def _do_download(args):
                                  int(args.get("page", 1)))
 
 
+def _do_search_en(args):
+    kw = args["query"]
+    rows = litfetch.search_en(kw, min(int(args.get("size", 10)), 30),
+                              args.get("source", "crossref"))
+    return {"count": len(rows), "query": kw, "source": args.get("source", "crossref"),
+            "results": rows}
+
+
 def _do_verify(args):
     results = litfetch.verify_citations(args["citations"])
     ok = sum(1 for r in results if r["verified"])
@@ -120,6 +142,8 @@ def call_tool(name, args):
         return _do_fetch(args)
     if name == "download":
         return _do_download(args)
+    if name == "search_en":
+        return _do_search_en(args)
     if name == "verify":
         return _do_verify(args)
     raise RuntimeError(f"unknown tool: {name}")

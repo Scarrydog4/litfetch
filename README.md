@@ -76,7 +76,7 @@ api88 短期会话（1 小时 JWT）工具每次自动重签，无需理会。
 | 操作 | 并发 | 限制 |
 |---|---|---|
 | search / verify | 随意并发（MCP 已线程化，agent 可同时发多个） | 无 |
-| 下载（fetch/download） | 进程内默认2、硬上限3 | 跨进程限速：同账号两次启动间隔≥2.5s（`LITFETCH_DL_MIN_INTERVAL`），日上限300（`LITFETCH_DAILY_CAP`） |
+| 下载（fetch/download） | 进程内默认2、硬上限3 | 跨进程限速：同账号两次启动间隔≥2.5s（`LITFETCH_DL_MIN_INTERVAL`），工具日上限10（`LITFETCH_DAILY_CAP`，**镜像单卡日限实测≈10篇**，想多下加卡） |
 | 真要多路并行 | 加会员卡即可 | 同目录放 `session-*.json`（多张卡），fetch 自动按卡分道 |
 
 **真实引用三件套**（防编造引用，供论文引擎调用）：
@@ -88,13 +88,21 @@ api88 短期会话（1 小时 JWT）工具每次自动重签，无需理会。
 
 注意：verify 输入必须是**具体引用条目或文献题名**，拿主题词去查会判不实（主题词不是文献）。
 
+## 多通道与英文
+
+- **知网多入口轮换**：session.json 的 `entries` 数组按序尝试（当前 l999 + 9991/ccki），某入口鉴权失败/抖动自动切下一个，检索更稳；下载固定走主通道（签名密钥按节点适配）。
+- **英文通道**：`search-en "query" [--source crossref|arxiv]`——Crossref（正式期刊，带 DOI，引用含卷期页）与 arXiv（预印本），免费公开 API、无会员依赖、稳定不限量。MCP 工具 `search_en` 同名同参；引擎侧 `en_literature`。
+- **英文核验**：verify 对英文期刊/会议类自动走 Crossref（带 DOI 溯源，同题多版本时优先著录期刊/年份都吻合的记录）；图书[M]仍走原通道。
+- **万方/维普**：入口 token 已探明（wf_auth→万方反代、cqvip→维普），属另一套站点协议，未封装；镜像额度耗尽时可作人工备选通道。
+
 ## 命令行用法
 
 ```bash
 ~/.litfetch/litfetch.py search "城市碳排放" [--page 1] [--size 20]
 ~/.litfetch/litfetch.py fetch "都市圈 碳排放" --top 3 --out 输出目录/ [--concurrency 2]
 ~/.litfetch/litfetch.py download "城市碳排放" --fileid FBSF202608014 --out 目录/
-~/.litfetch/litfetch.py verify 参考文献列表.txt --out 核验报告.md   # 防编造引用
+~/.litfetch/litfetch.py verify 参考文献列表.txt --out 核验报告.md   # 防编造引用（中文走知网/英文走Crossref）
+~/.litfetch/litfetch.py search-en "financial inclusion" [--source arxiv]
 ```
 
 ## 排障
