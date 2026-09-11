@@ -417,13 +417,40 @@ def run_download(kw, fileid, out_dir, page=1):
 
 
 def _title_from_citation(line):
-    """从 GB/T 7714 引用串里取题名；取不到就退化为整行。"""
+    """从 GB/T 7714 引用串里取题名；取不到就退化为最长分段。"""
     line = re.sub(r"^\[?\d+\]?\s*", "", line.strip())
-    m = re.match(r"^[^.]+\.(\S.*?)\[(?:J|D|C|N|M|G|Z|DB|OL)\]", line)
+    m = re.search(r"\[(?:J|D|C|N|M|G|R|S|A|DB|CP|EB)(?:/OL)?\]", line)
     if m:
-        return m.group(1).strip()
-    parts = [p.strip() for p in re.split(r"[.。;;]", line) if len(p.strip()) >= 4]
+        head = line[:m.start()]
+        parts = re.split(r"[.．]\s*", head, maxsplit=1)
+        if len(parts) == 2 and len(parts[1].strip()) >= 4:
+            return parts[1].strip()
+        return head.strip()
+    parts = [p.strip() for p in re.split(r"[.。．;；]", line) if len(p.strip()) >= 4]
     return max(parts, key=len) if parts else line.strip()
+
+
+def _cited_source_year(line):
+    """从引用串尾部取（著录期刊, 年份），取不到返回 (None, None)。"""
+    m = re.search(r"\[[A-Z]+(?:/OL)?\]\.?\s*([^,，.]+?)[,，]\s*(\d{4})", line)
+    if not m:
+        return None, None
+    return m.group(1).strip(), m.group(2)
+
+
+def citation_mismatch(ref, best):
+    """题名命中后核对著录出处：期刊不符或年份不符 → 返回差异说明；一致返回 None。"""
+    src, year = _cited_source_year(ref)
+    if src is None:
+        return None
+    actual_src = (best.get("source") or "").strip()
+    actual_year = (best.get("date") or "")[:4]
+    probs = []
+    if src not in actual_src and actual_src not in src:
+        probs.append(f"期刊不符：著录“{src}” vs 实际“{actual_src}”")
+    if year != actual_year:
+        probs.append(f"年份不符：著录{year} vs 实际{actual_year}")
+    return "；".join(probs) if probs else None
 
 
 def verify_citations(lines, client=None):
@@ -437,6 +464,10 @@ def verify_citations(lines, client=None):
         title = _title_from_citation(line)
         try:
             rows = c.search(title, 1, 10)
+            if not rows:  # 空结果可能是会话抖动，换新会话重试一次再定罪
+                c2 = Client(load_sessions()[0][1])
+                rows = c2.search(title, 1, 10)
+                c = c2
         except Exception as ex:  # noqa: BLE001
             out.append({"input": line, "verified": False, "reason": f"检索失败: {ex}"})
             continue
@@ -446,11 +477,16 @@ def verify_citations(lines, client=None):
             if rr > ratio:
                 best, ratio = r, rr
         if best and ratio >= 0.75:
-            out.append({"input": line, "verified": True, "confidence": round(ratio, 3),
-                        "matched_title": best["title"], "authors": best["authors"],
-                        "source": best["source"], "date": best["date"],
-                        "fileid": best["fileid"], "dbname": best["dbname"],
-                        "standard_cite": gbt7714(best), "provenance": provenance(best)})
+            mm = citation_mismatch(line, best)
+            base = {"input": line, "verified": True, "confidence": round(ratio, 3),
+                    "matched_title": best["title"], "authors": best["authors"],
+                    "source": best["source"], "date": best["date"],
+                    "fileid": best["fileid"], "dbname": best["dbname"],
+                    "standard_cite": gbt7714(best), "provenance": provenance(best)}
+            if mm:
+                base.update({"verified": "mismatch", "citation_mismatch": mm,
+                             "note": "题名真实存在，但著录出处与实际不符，须修正条目"})
+            out.append(base)
         else:
             out.append({"input": line, "verified": False, "confidence": round(ratio, 3),
                         "reason": "未找到足够相似的文献（可能为编造或题名抄错）",
