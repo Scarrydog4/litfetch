@@ -69,12 +69,32 @@ xy.shutong2.com，把这五个值更新进 session.json：yiffamlusername / yiff
 yiffamlgroupid / yiffamlrnd / yiffamlauth。更新后无需重启，下次调用自动生效。
 api88 短期会话（1 小时 JWT）工具每次自动重签，无需理会。
 
+## 并发与真实引用（论文平台接入指南）
+
+**分层并发策略**（风控只盯下载，检索不占额度）：
+
+| 操作 | 并发 | 限制 |
+|---|---|---|
+| search / verify | 随意并发（MCP 已线程化，agent 可同时发多个） | 无 |
+| 下载（fetch/download） | 进程内默认2、硬上限3 | 跨进程限速：同账号两次启动间隔≥2.5s（`LITFETCH_DL_MIN_INTERVAL`），日上限300（`LITFETCH_DAILY_CAP`） |
+| 真要多路并行 | 加会员卡即可 | 同目录放 `session-*.json`（多张卡），fetch 自动按卡分道 |
+
+**真实引用三件套**（防编造引用，供论文引擎调用）：
+
+1. 生产时用 search 收集引用——每条结果自带 `provenance` 溯源记录（fileid/库名/检索词/取回时间）；
+2. fetch 落盘 `references.md`（人读）+ `references-provenance.jsonl`（机器审计，可进评审包）；
+3. **定稿前用 verify 逐条回查**：把参考文献列表（每行一条，GB/T 7714 或裸题名）交给它，
+   题名相似度≥0.75 判实、否则报编造嫌疑，输出匹配到的真实元数据与修正后的标准引用。
+
+注意：verify 输入必须是**具体引用条目或文献题名**，拿主题词去查会判不实（主题词不是文献）。
+
 ## 命令行用法
 
 ```bash
 ~/.litfetch/litfetch.py search "城市碳排放" [--page 1] [--size 20]
-~/.litfetch/litfetch.py fetch "都市圈 碳排放" --top 3 --out 输出目录/
+~/.litfetch/litfetch.py fetch "都市圈 碳排放" --top 3 --out 输出目录/ [--concurrency 2]
 ~/.litfetch/litfetch.py download "城市碳排放" --fileid FBSF202608014 --out 目录/
+~/.litfetch/litfetch.py verify 参考文献列表.txt --out 核验报告.md   # 防编造引用
 ```
 
 ## 排障

@@ -3,9 +3,16 @@
 litfetch —— 萝卜图书馆(知网镜像)命令行检索/下载/引用工具（个人会员封装）
 
 用法（agent 友好，输出 JSON）：
-  litfetch.py search "城市碳排放" [--page 1] [--size 20] [--json]
+  litfetch.py search "城市碳排放" [--page 1] [--size 20]
   litfetch.py download "城市碳排放" --fileid FBSF202608014 [--out DIR]
   litfetch.py fetch    "城市碳排放" --top 3 --out DIR      # 检索+批量下载+参考文献一步完成
+  litfetch.py verify   参考文献列表.txt                     # 逐条核验引用真实性（平台防假引用）
+
+并发与风控策略（分层）：
+  - 检索（search/verify）：不消耗下载额度，可放心并发，MCP 服务器已支持并行调用。
+  - 下载：跨进程限速队列——同账号两次下载启动间隔 >= LITFETCH_DL_MIN_INTERVAL（默认2.5秒），
+    进程内并发默认2、硬上限3（LITFETCH_MAX_CONCURRENCY），日上限 LITFETCH_DAILY_CAP（默认300）。
+  - 真正要多路并行：同目录放 session-*.json（多张会员卡），fetch 自动按卡分道，互不挤占。
 
 链路（全部离线复刻，无需浏览器）：
   会员Cookie → 入口页(l999.php)签发JWT → apiXX.wenxian.shop/token换会话 → kns8检索接口
@@ -18,14 +25,19 @@ litfetch —— 萝卜图书馆(知网镜像)命令行检索/下载/引用工具
 """
 import argparse
 import base64
+import difflib
+import fcntl
+import hashlib
 import json
-import random
+import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 
@@ -107,14 +119,72 @@ def _aes_ecb_encrypt(key, data):
         out += _encrypt_block(data[off:off + 16], rks)
     return bytes(out)
 SESSION_FILE = Path(__file__).resolve().parent / "session.json"  # 跟随脚本所在目录，便于整目录搬运
-MAX_CONCURRENCY = 3
+DL_MIN_INTERVAL = float(os.environ.get("LITFETCH_DL_MIN_INTERVAL", "2.5"))
+DL_DAILY_CAP = int(os.environ.get("LITFETCH_DAILY_CAP", "300"))
+MAX_CONCURRENCY = min(3, int(os.environ.get("LITFETCH_MAX_CONCURRENCY", "3")))
 DB_TYPE = {"CAPJ": "J", "CJFQ": "J", "CDFD": "D", "CMFD": "D", "IPFD": "C",
            "CIPF": "C", "CCND": "N", "CCJD": "N", "CJFDb": "J"}
 
 
+def load_sessions():
+    """session.json 为主；同目录 session-*.json 视为额外会员卡（下载多路分道用）。"""
+    d = SESSION_FILE.parent
+    paths = sorted({SESSION_FILE, *d.glob("session-*.json")})
+    out = []
+    for p in paths:
+        try:
+            cfg = json.loads(p.read_text())
+            if cfg.get("cookies") and cfg.get("entry"):
+                out.append((p, cfg))
+        except Exception:
+            pass
+    if not out:
+        raise RuntimeError(f"无可用会话：{SESSION_FILE} 缺失或格式错误")
+    return out
+
+
+class DownloadGate:
+    """跨进程下载限速：同账号两次下载启动间隔不小于 min_interval，且有日上限。"""
+
+    def __init__(self, name):
+        self.path = SESSION_FILE.parent / f".dlgate_{hashlib.md5(name.encode()).hexdigest()[:10]}.json"
+
+    def acquire(self):
+        while True:
+            with open(self.path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                raw = f.read().strip()
+                try:
+                    st = json.loads(raw) if raw else {}
+                except Exception:
+                    st = {}
+                today = time.strftime("%Y-%m-%d")
+                if st.get("day") != today:
+                    st = {"day": today, "count": 0, "last": 0}
+                if st["count"] >= DL_DAILY_CAP:
+                    raise RuntimeError(
+                        f"已达今日下载上限 {DL_DAILY_CAP}（LITFETCH_DAILY_CAP 可调）")
+                wait = st.get("last", 0) + DL_MIN_INTERVAL - time.time()
+                if wait <= 0:
+                    st.update(last=time.time(), count=st["count"] + 1)
+                    f.seek(0)
+                    f.truncate()
+                    f.write(json.dumps(st))
+                    return
+            time.sleep(min(wait + 0.05, 5.0))
+
+
+def provenance(row):
+    """引用溯源记录：供论文平台审计参考文献真实性。"""
+    return {"engine": "BiXia文献(litfetch)", "fileid": row["fileid"], "dbname": row["dbname"],
+            "query": row["query"], "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "mirror": "萝卜图书馆(shutong2/wenxian.shop)"}
+
+
 class Client:
-    def __init__(self):
-        cfg = json.loads(SESSION_FILE.read_text())
+    def __init__(self, session=None):
+        cfg = session or json.loads(SESSION_FILE.read_text())
         self.entry = cfg["entry"]
         self.member = cfg["cookies"]
         self.jar = CookieJar()
@@ -287,6 +357,107 @@ def gbt7714(row):
     return f"{astr}. {row['title']}[{tag}]. {src}, {year}."
 
 
+def run_fetch(kw, top, out_dir, concurrency=2):
+    """检索+并行下载+参考文献。下载经跨进程限速门，按可用会员卡分道。"""
+    sessions = load_sessions()
+    n_workers = max(1, min(int(concurrency), MAX_CONCURRENCY, int(top)))
+    gates = {}
+
+    def lane_for(i):
+        p, cfg = sessions[i % len(sessions)]
+        gate = gates.setdefault(p.name, DownloadGate(p.name))
+        return Client(cfg), gate
+
+    rows = Client(sessions[0][1]).search(kw, 1, max(top * 2, 20))[:top]
+    out_dir = Path(out_dir)
+    done, failed = [], []
+    lock = threading.Lock()
+
+    def work(i, row):
+        try:
+            c, gate = lane_for(i)
+            gate.acquire()
+            res = c.download(row, out_dir)
+            with lock:
+                done.append(res)
+        except Exception as ex:  # noqa: BLE001
+            with lock:
+                failed.append({"fileid": row["fileid"], "title": row["title"], "error": str(ex)})
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        for f in [ex.submit(work, i, r) for i, r in enumerate(rows)]:
+            f.result()
+
+    cites = [gbt7714(r) for r in rows]
+    cite_path = out_dir / "references.md"
+    cite_path.parent.mkdir(parents=True, exist_ok=True)
+    cite_path.write_text("# 参考文献（GB/T 7714）\n\n" +
+                         "\n".join(f"{i+1}. {c_}" for i, c_ in enumerate(cites)) + "\n",
+                         encoding="utf-8")
+    prov_path = out_dir / "references-provenance.jsonl"
+    with open(prov_path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps({**provenance(r), "title": r["title"],
+                                "cite": gbt7714(r)}, ensure_ascii=False) + "\n")
+    return {"query": kw, "downloaded": done, "failed": failed,
+            "references": str(cite_path), "provenance": str(prov_path), "cites": cites}
+
+
+def run_download(kw, fileid, out_dir, page=1):
+    sessions = load_sessions()
+    c = Client(sessions[0][1])
+    rows = c.search(kw, page, 50)
+    row = next((r for r in rows if r["fileid"] == fileid), None)
+    if not row:
+        raise RuntimeError(f"fileid {fileid} 未在检索结果中找到")
+    DownloadGate("default").acquire()
+    res = c.download(row, Path(out_dir))
+    res["cite"] = gbt7714(row)
+    return res
+
+
+def _title_from_citation(line):
+    """从 GB/T 7714 引用串里取题名；取不到就退化为整行。"""
+    line = re.sub(r"^\[?\d+\]?\s*", "", line.strip())
+    m = re.match(r"^[^.]+\.(\S.*?)\[(?:J|D|C|N|M|G|Z|DB|OL)\]", line)
+    if m:
+        return m.group(1).strip()
+    parts = [p.strip() for p in re.split(r"[.。;;]", line) if len(p.strip()) >= 4]
+    return max(parts, key=len) if parts else line.strip()
+
+
+def verify_citations(lines, client=None):
+    """逐条核验参考文献真实性：回查镜像，题名相似度>=0.75 判实。检索不占下载额度。"""
+    c = client or Client(load_sessions()[0][1])
+    out = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        title = _title_from_citation(line)
+        try:
+            rows = c.search(title, 1, 10)
+        except Exception as ex:  # noqa: BLE001
+            out.append({"input": line, "verified": False, "reason": f"检索失败: {ex}"})
+            continue
+        best, ratio = None, 0.0
+        for r in rows:
+            rr = difflib.SequenceMatcher(None, r["title"], title).ratio()
+            if rr > ratio:
+                best, ratio = r, rr
+        if best and ratio >= 0.75:
+            out.append({"input": line, "verified": True, "confidence": round(ratio, 3),
+                        "matched_title": best["title"], "authors": best["authors"],
+                        "source": best["source"], "date": best["date"],
+                        "fileid": best["fileid"], "dbname": best["dbname"],
+                        "standard_cite": gbt7714(best), "provenance": provenance(best)})
+        else:
+            out.append({"input": line, "verified": False, "confidence": round(ratio, 3),
+                        "reason": "未找到足够相似的文献（可能为编造或题名抄错）",
+                        "closest": best["title"] if best else None})
+    return out
+
+
 def out_json(obj):
     print(json.dumps(obj, ensure_ascii=False, indent=1))
 
@@ -308,47 +479,42 @@ def main():
     p3.add_argument("keyword")
     p3.add_argument("--top", type=int, default=3)
     p3.add_argument("--out", required=True)
-    p3.add_argument("--concurrency", type=int, default=1,
-                    help=f"并发下载数，硬上限{MAX_CONCURRENCY}；建议保持1")
+    p3.add_argument("--concurrency", type=int, default=2,
+                    help=f"进程内下载并发，默认2，硬上限{MAX_CONCURRENCY}（跨进程另有间隔限速与日上限）")
+    p4 = sub.add_parser("verify", help="核验参考文献列表真实性（每行一条引用；防编造引用）")
+    p4.add_argument("file", nargs="?", help="引用列表文件；缺省读stdin")
+    p4.add_argument("--out", help="可选：把核验报告另存为 markdown")
     args = ap.parse_args()
 
-    c = Client()
     if args.cmd == "search":
-        rows = c.search(args.keyword, args.page, args.size)
+        rows = Client(load_sessions()[0][1]).search(args.keyword, args.page, args.size)
         out_json({"count": len(rows), "query": args.keyword,
-                  "results": [{**r, "cite": gbt7714(r),
+                  "results": [{**r, "cite": gbt7714(r), "provenance": provenance(r),
                                "abstract_query": r["abstract_query"][:24] + "…"}
                               for r in rows]})
         return
     if args.cmd == "download":
-        rows = c.search(args.keyword, args.page, 50)
-        row = next((r for r in rows if r["fileid"] == args.fileid), None)
-        if not row:
-            sys.exit(f"fileid {args.fileid} 未在检索结果中找到")
-        res = c.download(row, Path(args.out))
-        res["cite"] = gbt7714(row)
-        out_json(res)
+        out_json(run_download(args.keyword, args.fileid, args.out, args.page))
         return
     if args.cmd == "fetch":
-        conc = max(1, min(args.concurrency, MAX_CONCURRENCY))
-        rows = c.search(args.keyword, 1, max(args.top * 2, 20))[: args.top]
-        out_dir = Path(args.out)
-        done, failed = [], []
-        for i, row in enumerate(rows):
-            try:
-                done.append(c.download(row, out_dir))
-            except Exception as ex:
-                failed.append({"fileid": row["fileid"], "error": str(ex)})
-            if conc == 1 and i < len(rows) - 1:
-                time.sleep(random.uniform(1.5, 3.5))  # 人手级节奏，防风控
-        cites = [gbt7714(r) for r in rows]
-        cite_path = out_dir / "references.md"
-        cite_path.parent.mkdir(parents=True, exist_ok=True)
-        cite_path.write_text("# 参考文献（GB/T 7714）\n\n" +
-                             "\n".join(f"{i+1}. {c_}" for i, c_ in enumerate(cites)) + "\n",
-                            encoding="utf-8")
-        out_json({"query": args.keyword, "downloaded": done, "failed": failed,
-                  "references": str(cite_path), "cites": cites})
+        out_json(run_fetch(args.keyword, args.top, args.out, args.concurrency))
+        return
+    if args.cmd == "verify":
+        lines = (Path(args.file).read_text(encoding="utf-8").splitlines()
+                 if args.file else sys.stdin.read().splitlines())
+        results = verify_citations(lines)
+        ok = sum(1 for r in results if r["verified"])
+        if args.out:
+            p = Path(args.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("# 参考文献核验报告\n\n" + "\n".join(
+                f"- {'✅' if r['verified'] else '❌'} {r['input']}" +
+                (f"\n  - 匹配：{r['matched_title']}（{r['source']}，{r['date']}，相似度{r['confidence']}）"
+                 if r["verified"] else
+                 f"\n  - 原因：{r.get('reason', '')} 最接近：{r.get('closest') or '无'}")
+                for r in results) + "\n", encoding="utf-8")
+        out_json({"total": len(results), "verified": ok,
+                  "unverified": len(results) - ok, "results": results})
 
 
 if __name__ == "__main__":
